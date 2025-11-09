@@ -26,7 +26,7 @@ CHUNK_OVERLAP = 200
 MAX_PAGES = 50  # Scalability limit
 MAX_DEPTH = 2
 BATCH_SIZE = 100  # For Pinecone upserts
-USE_VISION = True  # Set False to skip GPT-4V (saves cost)
+USE_VISION = False  # Set False to skip GPT-4V (saves cost - using cheaper model)
 
 def get_base_url(url: str) -> str:
     from urllib.parse import urlparse
@@ -43,6 +43,98 @@ def generate_namespace(url: str) -> str:
     sanitized = sanitized[:20]  # Limit length
     namespace = f"{sanitized}_{namespace_hash}"
     return namespace
+
+def _extract_category(url: str, text: str) -> str:
+    """Extract category from URL or content."""
+    url_lower = url.lower()
+    text_lower = text.lower()[:500]  # Check first 500 chars
+    
+    # Check URL patterns
+    if any(word in url_lower for word in ['pricing', 'price', 'plan', 'cost']):
+        return 'pricing'
+    elif any(word in url_lower for word in ['product', 'service', 'feature']):
+        return 'products'
+    elif any(word in url_lower for word in ['contact', 'support', 'help', 'faq']):
+        return 'support'
+    elif any(word in url_lower for word in ['about', 'company', 'team']):
+        return 'about'
+    elif any(word in url_lower for word in ['blog', 'news', 'article']):
+        return 'blog'
+    
+    # Check content patterns
+    if any(word in text_lower for word in ['price', 'cost', 'plan', 'subscription']):
+        return 'pricing'
+    elif any(word in text_lower for word in ['product', 'service', 'feature']):
+        return 'products'
+    elif any(word in text_lower for word in ['contact', 'support', 'help']):
+        return 'support'
+    
+    return 'general'
+
+def _extract_topic(url: str, text: str, page_title: str) -> str:
+    """Extract specific topic from URL, title, or content."""
+    # Use page title if available
+    if page_title and len(page_title) < 50:
+        return page_title.lower()
+    
+    # Extract from URL
+    url_parts = url.lower().split('/')
+    if len(url_parts) > 1:
+        last_part = url_parts[-1].replace('-', ' ').replace('_', ' ')
+        if last_part and len(last_part) < 30:
+            return last_part
+    
+    # Extract from first sentence of text
+    first_sentence = text.split('.')[0][:50] if text else ''
+    return first_sentence.lower() if first_sentence else 'general'
+
+def _extract_keywords(text: str, page_title: str) -> str:
+    """Extract important keywords from text and title."""
+    # Common important words
+    important_words = []
+    
+    # From title
+    if page_title:
+        title_words = re.findall(r'\b\w{4,}\b', page_title.lower())
+        important_words.extend(title_words[:5])
+    
+    # From text (first 200 chars)
+    text_sample = text[:200].lower()
+    text_words = re.findall(r'\b\w{4,}\b', text_sample)
+    
+    # Get most common words (excluding common stop words)
+    stop_words = {'this', 'that', 'with', 'from', 'have', 'been', 'will', 'your', 'their', 'there', 'what', 'when', 'where', 'which', 'about', 'after', 'before', 'during', 'under', 'above', 'below', 'between', 'through'}
+    filtered_words = [w for w in text_words if w not in stop_words]
+    
+    # Get unique words
+    unique_words = list(set(filtered_words))[:10]
+    important_words.extend(unique_words)
+    
+    # Remove duplicates and limit
+    keywords = list(dict.fromkeys(important_words))[:15]  # Max 15 keywords
+    return ', '.join(keywords)
+
+def _extract_intent(url: str, text: str, page_title: str) -> str:
+    """Extract customer intent from URL or content."""
+    url_lower = url.lower()
+    text_lower = text.lower()[:300]
+    title_lower = page_title.lower()
+    
+    combined = f"{url_lower} {title_lower} {text_lower}"
+    
+    # Intent patterns
+    if any(word in combined for word in ['buy', 'purchase', 'order', 'cart', 'checkout', 'price', 'cost', 'plan']):
+        return 'buy'
+    elif any(word in combined for word in ['learn', 'about', 'what', 'how', 'guide', 'tutorial']):
+        return 'learn'
+    elif any(word in combined for word in ['contact', 'support', 'help', 'faq', 'question']):
+        return 'support'
+    elif any(word in combined for word in ['compare', 'vs', 'difference', 'versus']):
+        return 'compare'
+    elif any(word in combined for word in ['sign', 'register', 'signup', 'join']):
+        return 'signup'
+    
+    return 'general'
 
 async def can_crawl(url: str, base_url: str) -> bool:
     rp = RobotFileParser()
@@ -84,12 +176,11 @@ async def describe_image(image_url: str, alt: str) -> str:
                     if img.size[0] < 100 or img.size[1] < 100:  # Skip icons
                         return "Decorative image"
         
-        # Use GPT-4V for description
-        llm = ChatOpenAI(model="gpt-4-vision-preview", max_tokens=50)
-        response = llm.invoke([
-            {"type": "text", "text": "Describe this image briefly for searchability."},
-            {"type": "image_url", "image_url": {"url": image_url}}
-        ])
+        # Use GPT-3.5-turbo for description (cheaper than GPT-4V)
+        # Note: GPT-3.5 doesn't support vision, so we'll use a simple description based on alt text
+        # For cost efficiency, we skip vision API calls
+        llm = ChatOpenAI(model="gpt-3.5-turbo", max_tokens=50, temperature=0.3)
+        response = llm.invoke(f"Describe this image briefly for searchability based on context: {alt}")
         return response.content
     except Exception:
         return alt
@@ -157,6 +248,20 @@ async def crawl_and_process(start_url: str):
                 await page.goto(url, wait_until="networkidle", timeout=30000)
                 text, images = await scrape_page(page, url)
                 
+                # Get page content for metadata extraction
+                content = await page.content()
+                soup = BeautifulSoup(content, 'html.parser')
+                
+                # Extract page title and metadata
+                page_title = soup.find('title')
+                page_title_text = page_title.get_text().strip() if page_title else url.split('/')[-1]
+                
+                # Try to extract category/topic from URL or content
+                category = _extract_category(url, text)
+                topic = _extract_topic(url, text, page_title_text)
+                keywords = _extract_keywords(text, page_title_text)
+                intent = _extract_intent(url, text, page_title_text)
+                
                 # Chunk text
                 chunks = splitter.split_text(text)
                 for chunk in chunks:
@@ -167,8 +272,22 @@ async def crawl_and_process(start_url: str):
                     img_chunk = f"Image on {url}: {img['description']}"
                     chunks.append(img_chunk)
                 
-                # Collect for batching
-                metadata = [{'url': url, 'type': 'text' if 'Page:' in c else 'image'} for c in chunks]
+                # Collect for batching with enhanced metadata
+                metadata = []
+                for c in chunks:
+                    chunk_meta = {
+                        'url': url,
+                        'type': 'text' if 'Page:' in c else 'image',
+                        'page_title': page_title_text,
+                        'category': category,
+                        'topic': topic,
+                        'keywords': keywords,
+                        'intent': intent,
+                        'section': 'main',
+                        'priority': 5  # Default priority
+                    }
+                    metadata.append(chunk_meta)
+                
                 all_chunks.extend(chunks)
                 all_metadata.extend(metadata)
                 

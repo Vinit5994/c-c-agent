@@ -10,3 +10,6 @@ __pycache__
 *.pyzw
 *.pyzwz
 *.pyzwzw
+*.log
+whatsapp_session/
+node_modules/
